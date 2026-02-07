@@ -122,13 +122,19 @@ pub const Bucket = struct {
         };
 
         // Decode base64 into an owned buffer
-        const decoded_len = std.base64.standard.Decoder.calcSizeUpperBound(b64_data.len);
-        const decoded_buf = self.allocator.alloc(u8, decoded_len) catch return Error.OutOfMemory;
+        const actual_len = std.base64.standard.Decoder.calcSizeForSlice(b64_data) catch {
+            // If base64 is invalid, maybe it's raw data (some NATS versions)
+            return Entry{
+                .key = key,
+                .value = "",
+                .revision = revision,
+                .operation = .put,
+            };
+        };
+        const decoded_buf = self.allocator.alloc(u8, actual_len) catch return Error.OutOfMemory;
 
-        const actual_len = std.base64.standard.Decoder.decode(decoded_buf, b64_data) catch |err| {
+        std.base64.standard.Decoder.decode(decoded_buf, b64_data) catch {
             self.allocator.free(decoded_buf);
-            // If base64 decode fails, maybe it's raw data (some NATS versions)
-            _ = err;
             return Entry{
                 .key = key,
                 .value = "",
