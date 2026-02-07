@@ -54,4 +54,17 @@ pub fn build(b: *std.Build) void {
     const integration_test_step = b.step("test-integration", "Run integration tests only");
     integration_test_step.dependOn(&run_integration_tests.step);
 
+    // TLS test (requires TLS-enabled NATS server on localhost:4443)
+    const tls_test_module = b.createModule(.{
+        .root_source_file = b.path("test/tls_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tls_test_module.addImport("nats", nats_module);
+    const tls_tests = b.addTest(.{
+        .root_module = tls_test_module,
+    });
+    const run_tls_tests = b.addRunArtifact(tls_tests);
+    const tls_test_step = b.step("test-tls", "Run TLS integration tests (requires TLS NATS server)");
+    tls_test_step.dependOn(&run_tls_tests.step);
 }

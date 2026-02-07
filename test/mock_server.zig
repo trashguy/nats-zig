@@ -280,91 +280,23 @@ pub const MockServer = struct {
         }
     }
 
-    fn routeMessage(sock: posix.socket_t, subs: *std.StringHashMapUnmanaged([]const u8), subject: []const u8, reply_to: ?[]const u8, payload: ?[]const u8, js_state: *JetStreamState) void {
-        if (reply_to) |rt| {
-            // Handle JetStream API requests ($JS.API.>): reply with API response
-            if (std.mem.startsWith(u8, subject, "$JS.API.")) {
-                const response = js_state.handleRequest(subject, payload);
-                sendToInbox(sock, subs, rt, response);
-                return;
-            }
-
-            // Handle JetStream publish (any PUB with reply_to to an _INBOX):
-            // Real NATS sends a PubAck if subject matches a stream
-            if (std.mem.startsWith(u8, rt, "_INBOX.")) {
-                const response = js_state.pubAckResponse();
-                sendToInbox(sock, subs, rt, response);
-                return;
-            }
-        }
-
-        // Regular message routing (echo/fan-out)
-        if (subs.get(subject)) |sid| {
-            sendMsgToClient(sock, subject, sid, reply_to, payload);
-            return;
-        }
-
-        var it = subs.iterator();
-        while (it.next()) |entry| {
-            if (subjectMatch(entry.key_ptr.*, subject)) {
-                sendMsgToClient(sock, subject, entry.value_ptr.*, reply_to, payload);
-            }
-        }
-    }
-
-    fn sendToInbox(sock: posix.socket_t, subs: *std.StringHashMapUnmanaged([]const u8), inbox: []const u8, response: []const u8) void {
-        if (subs.get(inbox)) |sid| {
-            sendMsgToClient(sock, inbox, sid, null, response);
-            return;
-        }
-        var it = subs.iterator();
-        while (it.next()) |entry| {
-            if (subjectMatch(entry.key_ptr.*, inbox)) {
-                sendMsgToClient(sock, inbox, entry.value_ptr.*, null, response);
-                return;
-            }
-        }
-    }
-
-    fn sendMsgToClient(sock: posix.socket_t, subject: []const u8, sid: []const u8, reply_to: ?[]const u8, payload: ?[]const u8) void {
-        var buf: [65536]u8 = undefined;
-        var stream = std.io.fixedBufferStream(&buf);
-        const writer = stream.writer();
-
-        const payload_len = if (payload) |p| p.len else 0;
-
-        if (reply_to) |rt| {
-            std.fmt.format(writer, "MSG {s} {s} {s} {d}\r\n", .{ subject, sid, rt, payload_len }) catch return;
-        } else {
-            std.fmt.format(writer, "MSG {s} {s} {d}\r\n", .{ subject, sid, payload_len }) catch return;
-        }
-
-        if (payload) |p| writer.writeAll(p) catch return;
-        writer.writeAll("\r\n") catch return;
-
-        sendAll(sock, stream.getWritten()) catch return;
-    }
-
-    fn consumeLine(buf: *[65536]u8, buf_len: *usize, consumed: usize) void {
-        const remaining = buf_len.* - consumed;
-        if (remaining > 0) {
-            std.mem.copyForwards(u8, buf, buf[consumed..buf_len.*]);
-        }
-        buf_len.* = remaining;
-    }
-
-    fn sendAll(sock: posix.socket_t, data: []const u8) !void {
-        var sent: usize = 0;
-        while (sent < data.len) {
-            sent += posix.send(sock, data[sent..], 0) catch return error.ConnectionClosed;
-        }
-    }
 };
+
+const MAX_JS_STORED = 64;
 
 /// Minimal JetStream state for mock testing.
 const JetStreamState = struct {
     next_seq: u64 = 1,
     response_buf: [4096]u8 = undefined,
+
+    // Store published KV messages for consumer delivery
+    stored_subjects: [MAX_JS_STORED][256]u8 = undefined,
+    stored_subject_lens: [MAX_JS_STORED]usize = [_]usize{0} ** MAX_JS_STORED,
+    stored_payloads: [MAX_JS_STORED][1024]u8 = undefined,
+    stored_payload_lens: [MAX_JS_STORED]usize = [_]usize{0} ** MAX_JS_STORED,
+    stored_seqs: [MAX_JS_STORED]u64 = [_]u64{0} ** MAX_JS_STORED,
+    stored_count: usize = 0,
+    consumer_deliver_idx: usize = 0,
 
     fn handleRequest(self: *JetStreamState, subject: []const u8, payload: ?[]const u8) []const u8 {
         _ = payload;
@@ -393,8 +325,56 @@ const JetStreamState = struct {
             return self.simpleOkResponse();
         }
 
+        if (std.mem.startsWith(u8, api_path, "STREAM.MSG.GET.")) {
+            return self.streamMsgGetResponse();
+        }
+
         // Default: pub ack (for JetStream publish)
         return self.pubAckResponse();
+    }
+
+    /// Handle CONSUMER.MSG.NEXT — deliver stored messages to the fetch inbox.
+    fn handleFetchRequest(self: *JetStreamState, sock: posix.socket_t, subs: *std.StringHashMapUnmanaged([]const u8), inbox: []const u8) void {
+        if (self.consumer_deliver_idx >= self.stored_count) {
+            // No more messages — send a 404 status via HMSG to indicate no messages
+            sendToInbox(sock, subs, inbox, null);
+            return;
+        }
+
+        const idx = self.consumer_deliver_idx;
+        self.consumer_deliver_idx += 1;
+
+        const msg_subject = self.stored_subjects[idx][0..self.stored_subject_lens[idx]];
+        const msg_payload = if (self.stored_payload_lens[idx] > 0)
+            self.stored_payloads[idx][0..self.stored_payload_lens[idx]]
+        else
+            null;
+        const seq = self.stored_seqs[idx];
+
+        // Build a reply-to that encodes the sequence number in JetStream ACK format
+        // $JS.ACK.<stream>.<consumer>.<delivered>.<stream_seq>.<consumer_seq>.<timestamp>.<pending>
+        var ack_buf: [256]u8 = undefined;
+        const ack_subject = std.fmt.bufPrint(&ack_buf, "$JS.ACK.TEST.mock-consumer.1.{d}.{d}.0.0", .{ seq, idx + 1 }) catch return;
+
+        // Send as MSG with the KV subject and ACK reply_to
+        sendMsgWithReplyTo(sock, subs, inbox, msg_subject, ack_subject, msg_payload);
+    }
+
+    fn storeMessage(self: *JetStreamState, subject: []const u8, payload: ?[]const u8) void {
+        if (self.stored_count >= MAX_JS_STORED) return;
+        const idx = self.stored_count;
+        const slen = @min(subject.len, 256);
+        @memcpy(self.stored_subjects[idx][0..slen], subject[0..slen]);
+        self.stored_subject_lens[idx] = slen;
+        if (payload) |p| {
+            const plen = @min(p.len, 1024);
+            @memcpy(self.stored_payloads[idx][0..plen], p[0..plen]);
+            self.stored_payload_lens[idx] = plen;
+        } else {
+            self.stored_payload_lens[idx] = 0;
+        }
+        self.stored_seqs[idx] = self.next_seq - 1;
+        self.stored_count += 1;
     }
 
     fn pubAckResponse(self: *JetStreamState) []const u8 {
@@ -415,9 +395,27 @@ const JetStreamState = struct {
 
     fn consumerInfoResponse(self: *JetStreamState) []const u8 {
         var stream = std.io.fixedBufferStream(&self.response_buf);
-        stream.writer().writeAll(
-            \\{"type":"io.nats.jetstream.api.v1.consumer_create_response","config":{},"num_pending":0,"num_ack_pending":0}
-        ) catch return "{}";
+        const consumer_name = "mock-consumer";
+        std.fmt.format(stream.writer(),
+            \\{{"type":"io.nats.jetstream.api.v1.consumer_create_response","name":"{s}","config":{{}},"num_pending":{d},"num_ack_pending":0}}
+        , .{ consumer_name, self.stored_count }) catch return "{}";
+        return stream.getWritten();
+    }
+
+    fn streamMsgGetResponse(self: *JetStreamState) []const u8 {
+        if (self.stored_count == 0) {
+            var stream = std.io.fixedBufferStream(&self.response_buf);
+            stream.writer().writeAll(
+                \\{"error":{"code":404,"err_code":10037,"description":"no message found"}}
+            ) catch return "{}";
+            return stream.getWritten();
+        }
+        // Return the last stored message
+        const idx = self.stored_count - 1;
+        var stream = std.io.fixedBufferStream(&self.response_buf);
+        std.fmt.format(stream.writer(),
+            \\{{"type":"io.nats.jetstream.api.v1.stream_msg_get_response","message":{{"subject":"test","seq":{d},"data":""}}}}
+        , .{self.stored_seqs[idx]}) catch return "{}";
         return stream.getWritten();
     }
 
@@ -428,7 +426,121 @@ const JetStreamState = struct {
         ) catch return "{}";
         return stream.getWritten();
     }
+
 };
+
+// ── Free helper functions (used by both MockServer and JetStreamState) ──
+
+fn routeMessage(sock: posix.socket_t, subs: *std.StringHashMapUnmanaged([]const u8), subject: []const u8, reply_to: ?[]const u8, payload: ?[]const u8, js_state: *JetStreamState) void {
+    if (reply_to) |rt| {
+        if (std.mem.startsWith(u8, subject, "$JS.API.")) {
+            const api_path = subject[8..];
+            if (std.mem.startsWith(u8, api_path, "CONSUMER.MSG.NEXT.")) {
+                js_state.handleFetchRequest(sock, subs, rt);
+                return;
+            }
+            const response = js_state.handleRequest(subject, payload);
+            sendToInbox(sock, subs, rt, response);
+            return;
+        }
+
+        if (std.mem.startsWith(u8, rt, "_INBOX.")) {
+            if (std.mem.startsWith(u8, subject, "$KV.")) {
+                const response = js_state.pubAckResponse();
+                js_state.storeMessage(subject, payload);
+                sendToInbox(sock, subs, rt, response);
+                return;
+            }
+            const response = js_state.pubAckResponse();
+            sendToInbox(sock, subs, rt, response);
+            return;
+        }
+    }
+
+    if (subs.get(subject)) |sid| {
+        sendMsgToClient(sock, subject, sid, reply_to, payload);
+        return;
+    }
+
+    var it = subs.iterator();
+    while (it.next()) |entry| {
+        if (subjectMatch(entry.key_ptr.*, subject)) {
+            sendMsgToClient(sock, subject, entry.value_ptr.*, reply_to, payload);
+        }
+    }
+}
+
+fn sendToInbox(sock: posix.socket_t, subs: *std.StringHashMapUnmanaged([]const u8), inbox: []const u8, response: ?[]const u8) void {
+    if (subs.get(inbox)) |sid| {
+        sendMsgToClient(sock, inbox, sid, null, response);
+        return;
+    }
+    var it = subs.iterator();
+    while (it.next()) |entry| {
+        if (subjectMatch(entry.key_ptr.*, inbox)) {
+            sendMsgToClient(sock, inbox, entry.value_ptr.*, null, response);
+            return;
+        }
+    }
+}
+
+fn sendMsgToClient(sock: posix.socket_t, subject: []const u8, sid: []const u8, reply_to: ?[]const u8, payload: ?[]const u8) void {
+    var buf: [65536]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const writer = fbs.writer();
+
+    const payload_len = if (payload) |p| p.len else 0;
+
+    if (reply_to) |rt| {
+        std.fmt.format(writer, "MSG {s} {s} {s} {d}\r\n", .{ subject, sid, rt, payload_len }) catch return;
+    } else {
+        std.fmt.format(writer, "MSG {s} {s} {d}\r\n", .{ subject, sid, payload_len }) catch return;
+    }
+
+    if (payload) |p| writer.writeAll(p) catch return;
+    writer.writeAll("\r\n") catch return;
+
+    sendAll(sock, fbs.getWritten()) catch return;
+}
+
+fn sendMsgWithReplyTo(sock: posix.socket_t, subs: *std.StringHashMapUnmanaged([]const u8), inbox: []const u8, msg_subject: []const u8, ack_reply: []const u8, payload: ?[]const u8) void {
+    const sid = findSidForSubject(subs, inbox) orelse return;
+
+    var buf: [65536]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const writer = fbs.writer();
+
+    const payload_len = if (payload) |p| p.len else 0;
+    std.fmt.format(writer, "MSG {s} {s} {s} {d}\r\n", .{ msg_subject, sid, ack_reply, payload_len }) catch return;
+    if (payload) |p| writer.writeAll(p) catch return;
+    writer.writeAll("\r\n") catch return;
+
+    sendAll(sock, fbs.getWritten()) catch return;
+}
+
+fn findSidForSubject(subs: *std.StringHashMapUnmanaged([]const u8), subject: []const u8) ?[]const u8 {
+    if (subs.get(subject)) |sid| return sid;
+    var it = subs.iterator();
+    while (it.next()) |entry| {
+        if (subjectMatch(entry.key_ptr.*, subject)) return entry.value_ptr.*;
+    }
+    return null;
+}
+
+fn consumeLine(buf: *[65536]u8, buf_len: *usize, consumed: usize) void {
+    const remaining = buf_len.* - consumed;
+    if (remaining > 0) {
+        std.mem.copyForwards(u8, buf, buf[consumed..buf_len.*]);
+    }
+    buf_len.* = remaining;
+}
+
+fn sendAll(sock: posix.socket_t, data: []const u8) !void {
+    var sent: usize = 0;
+    while (sent < data.len) {
+        sent += posix.send(sock, data[sent..], 0) catch return error.ConnectionClosed;
+    }
+}
 
 pub fn subjectMatch(pattern: []const u8, subject: []const u8) bool {
     var pat_it = std.mem.tokenizeScalar(u8, pattern, '.');

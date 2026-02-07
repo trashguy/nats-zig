@@ -2,7 +2,7 @@
 
 Pure Zig [NATS](https://nats.io) client library. Zero dependencies beyond `std`.
 
-Requires Zig 0.14+.
+Requires Zig 0.15+.
 
 ## Features
 
@@ -21,6 +21,8 @@ Requires Zig 0.14+.
 - Token and username/password authentication
 - URL-embedded credentials (`nats://user:pass@host`)
 - Connection status tracking (disconnected, connected, reconnecting, draining)
+- TLS via `std.crypto.tls` (auto-upgrade on `tls://` URLs or server requirement)
+- Configurable certificate verification (`tls_verify` option)
 
 ### JetStream
 - Stream CRUD (create, update, delete, info)
@@ -36,10 +38,8 @@ Requires Zig 0.14+.
 - Revision tracking via JetStream sequence numbers
 - Backed by JetStream streams (`KV_<bucket>`)
 - Configurable history, TTL, max value size, storage, and replication
-
-### Planned
-- TLS via `std.crypto.tls` (infrastructure in place, upgrade not yet wired)
-- KeyValue watch
+- Watch for key changes with `Watcher` (put, delete, purge operations)
+- Keys-only watch mode (headers only, no values transferred)
 
 ## Usage
 
@@ -153,9 +153,26 @@ try kv.delete("app.setting");
 ## Building
 
 ```bash
-zig build          # Compile
-zig build test     # Run all tests
+zig build               # Compile
+zig build test           # Run all tests
+zig build test-unit      # Unit tests only
+zig build test-integration # Integration tests (uses mock server)
+zig build test-tls       # TLS tests (requires TLS NATS server, see below)
 ```
+
+### TLS Testing
+
+TLS tests require a NATS server with TLS enabled on port 4443:
+
+```bash
+# Generate self-signed certs for testing (or use your own)
+nats-server --tls --tlscert=server-cert.pem --tlskey=server-key.pem -p 4443
+
+# Run TLS tests
+zig build test-tls
+```
+
+If no TLS server is available, the tests skip gracefully.
 
 ## Architecture
 
@@ -164,11 +181,12 @@ Client (public API)
 ├── publish(), subscribe(), request()
 ├── Subscription Manager (sid allocation, dispatch)
 ├── Protocol (wire parser + serializer)
-├── Connection (TCP, buffered I/O, reconnect)
+├── Connection (TCP, buffered I/O, reconnect, TLS)
 ├── JetStream (streams, consumers, pull subscriptions)
 │   └── PullSubscription (fetch, ack, nak)
-├── KeyValue (buckets, get/put/delete)
-│   └── backed by JetStream streams
+├── KeyValue (buckets, get/put/delete, watch)
+│   ├── backed by JetStream streams
+│   └── Watcher (live key change notifications)
 └── Headers (HMSG/HPUB support)
 ```
 

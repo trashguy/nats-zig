@@ -179,6 +179,8 @@ pub const ConsumerConfig = struct {
     filter_subject: ?[]const u8 = null,
     deliver_subject: ?[]const u8 = null,
     ack_policy: AckPolicy = .explicit,
+    deliver_policy: ?DeliverPolicy = null,
+    headers_only: ?bool = null,
     max_deliver: i64 = -1,
     ack_wait_ns: i64 = 30_000_000_000,
 };
@@ -191,14 +193,28 @@ pub const StreamInfo = struct {
 };
 
 pub const ConsumerInfo = struct {
+    name_buf: [128]u8 = undefined,
+    name_len: u8 = 0,
     num_pending: u64 = 0,
     num_ack_pending: u64 = 0,
+
+    pub fn name(self: *const ConsumerInfo) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
 };
 
 pub const Retention = enum { limits, interest, workqueue };
 pub const Storage = enum { file, memory };
 pub const Discard = enum { old, new };
 pub const AckPolicy = enum { none, all, explicit };
+pub const DeliverPolicy = enum {
+    all,
+    last,
+    new,
+    by_start_sequence,
+    by_start_time,
+    last_per_subject,
+};
 
 // ── Pull Subscription ──
 
@@ -382,6 +398,24 @@ fn serializeConsumerConfig(buf: []u8, config: ConsumerConfig) ![]const u8 {
     });
     try w.writeAll("\"");
 
+    if (config.deliver_policy) |dp| {
+        try w.writeAll(",\"deliver_policy\":\"");
+        try w.writeAll(switch (dp) {
+            .all => "all",
+            .last => "last",
+            .new => "new",
+            .by_start_sequence => "by_start_sequence",
+            .by_start_time => "by_start_time",
+            .last_per_subject => "last_per_subject",
+        });
+        try w.writeAll("\"");
+    }
+
+    if (config.headers_only) |ho| {
+        try w.writeAll(",\"headers_only\":");
+        try w.writeAll(if (ho) "true" else "false");
+    }
+
     try std.fmt.format(w, ",\"max_deliver\":{d}", .{config.max_deliver});
     try std.fmt.format(w, ",\"ack_wait\":{d}", .{config.ack_wait_ns});
 
@@ -437,6 +471,11 @@ fn parseConsumerInfo(data: []const u8) Error!ConsumerInfo {
     if (checkJsError(data)) |err| return err;
 
     var info = ConsumerInfo{};
+    if (extractJsonString(data, "name")) |n| {
+        const len = @min(n.len, info.name_buf.len);
+        @memcpy(info.name_buf[0..len], n[0..len]);
+        info.name_len = @intCast(len);
+    }
     if (extractJsonInt(data, "num_pending")) |v| info.num_pending = std.math.cast(u64, v) orelse 0;
     if (extractJsonInt(data, "num_ack_pending")) |v| info.num_ack_pending = std.math.cast(u64, v) orelse 0;
 
@@ -529,6 +568,27 @@ test "serialize consumer config" {
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"durable_name\":\"my-consumer\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"ack_policy\":\"explicit\"") != null);
+}
+
+test "serialize consumer config with deliver_policy" {
+    var buf: [4096]u8 = undefined;
+    const json = try serializeConsumerConfig(&buf, .{
+        .deliver_policy = .last_per_subject,
+        .headers_only = true,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"deliver_policy\":\"last_per_subject\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"headers_only\":true") != null);
+}
+
+test "serialize consumer config omits null deliver_policy" {
+    var buf: [4096]u8 = undefined;
+    const json = try serializeConsumerConfig(&buf, .{
+        .durable_name = "test",
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "deliver_policy") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "headers_only") == null);
 }
 
 test "parse pub ack" {

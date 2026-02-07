@@ -2,6 +2,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Protocol = @import("Protocol.zig");
 const posix = std.posix;
+const tls = std.crypto.tls;
+const Certificate = std.crypto.Certificate;
+const Io = std.Io;
 
 /// Manages a TCP connection to a NATS server with buffered I/O.
 const Connection = @This();
@@ -36,9 +39,35 @@ pub const ServerUrl = struct {
 const READ_BUF_SIZE = 64 * 1024;
 const WRITE_BUF_SIZE = 64 * 1024;
 
+/// TLS state stored on the heap (TLS client is non-movable due to internal pointers).
+pub const TlsState = struct {
+    tls_client: tls.Client,
+    ca_bundle: Certificate.Bundle,
+    /// Socket wrapped as an std.net.Stream for the TLS client's encrypted I/O.
+    net_stream: std.net.Stream,
+    net_reader: std.net.Stream.Reader,
+    net_writer: std.net.Stream.Writer,
+    /// Buffers owned by TlsState for the TLS read/write operations.
+    tls_read_buf: []u8,
+    tls_write_buf: []u8,
+    io_read_buf: []u8,
+    io_write_buf: []u8,
+    allocator: Allocator,
+
+    pub fn deinit(self: *TlsState) void {
+        self.ca_bundle.deinit(self.allocator);
+        self.allocator.free(self.tls_read_buf);
+        self.allocator.free(self.tls_write_buf);
+        self.allocator.free(self.io_read_buf);
+        self.allocator.free(self.io_write_buf);
+        self.allocator.destroy(self);
+    }
+};
+
 socket: posix.socket_t = undefined,
 connected: bool = false,
 is_tls: bool = false,
+tls_state: ?*TlsState = null,
 
 read_buf: [READ_BUF_SIZE]u8 = undefined,
 read_start: usize = 0,
@@ -115,6 +144,10 @@ pub fn connect(self: *Connection, host: []const u8, port: u16) ConnectError!void
 
 pub fn disconnect(self: *Connection) void {
     if (self.connected) {
+        if (self.tls_state) |ts| {
+            ts.deinit();
+            self.tls_state = null;
+        }
         posix.close(self.socket);
         self.connected = false;
         self.is_tls = false;
@@ -126,37 +159,100 @@ pub fn disconnect(self: *Connection) void {
 
 /// Upgrade the current TCP connection to TLS.
 ///
-/// This uses Zig's std.crypto.tls.Client which requires std.Io.Reader/Writer
-/// abstractions. Currently stubbed — returns an error. For production TLS use,
-/// this needs to wrap the socket in std.Io.Reader/Writer and perform the
-/// TLS handshake.
+/// Creates std.net.Stream Reader/Writer from the raw socket, loads system CA
+/// certificates, performs the TLS handshake, and installs the TLS state. All
+/// subsequent read/write operations are transparently encrypted.
 ///
-/// To use TLS with NATS, connect to a NATS server that has TLS configured:
-///   nats-server --tls --tlscert=server-cert.pem --tlskey=server-key.pem
-///
-/// The client will detect TLS is required either from:
-///   1. URL scheme: tls://host:port
-///   2. Server INFO: tls_required=true
-///   3. Client option: tls_required=true
-pub fn upgradeTls(self: *Connection, host: []const u8) ConnectError!void {
-    _ = host;
+/// If `verify` is false, certificate verification is skipped (dev/testing only).
+pub fn upgradeTls(self: *Connection, allocator: Allocator, host: []const u8, verify: bool) ConnectError!void {
     if (!self.connected) return ConnectError.HandshakeFailed;
 
-    // TODO: Implement TLS upgrade using std.crypto.tls.Client
-    // The Zig 0.15 TLS client requires std.Io.Reader/Writer wrappers
-    // around the raw socket, and a certificate bundle for verification.
-    //
-    // Rough implementation:
-    //   1. Create std.Io.Reader wrapping self.socket recv
-    //   2. Create std.Io.Writer wrapping self.socket send
-    //   3. Call std.crypto.tls.Client.init(reader, writer, .{
-    //        .host = .{ .explicit = host },
-    //        .ca = .{ .no_verification },  // or bundle from system
-    //   })
-    //   4. Replace recv/send paths to use TLS client reader/writer
-    //
-    // For now, return error to indicate TLS is not yet fully implemented.
-    return ConnectError.HandshakeFailed;
+    // Allocate TLS state on the heap (TLS client is non-movable)
+    const ts = allocator.create(TlsState) catch return ConnectError.OutOfMemory;
+    errdefer allocator.destroy(ts);
+
+    // Allocate buffers for TLS I/O
+    const io_read_buf = allocator.alloc(u8, tls.Client.min_buffer_len) catch {
+        allocator.destroy(ts);
+        return ConnectError.OutOfMemory;
+    };
+    errdefer allocator.free(io_read_buf);
+
+    const io_write_buf = allocator.alloc(u8, 16384) catch {
+        allocator.free(io_read_buf);
+        allocator.destroy(ts);
+        return ConnectError.OutOfMemory;
+    };
+    errdefer allocator.free(io_write_buf);
+
+    const tls_read_buf = allocator.alloc(u8, tls.Client.min_buffer_len) catch {
+        allocator.free(io_write_buf);
+        allocator.free(io_read_buf);
+        allocator.destroy(ts);
+        return ConnectError.OutOfMemory;
+    };
+    errdefer allocator.free(tls_read_buf);
+
+    const tls_write_buf = allocator.alloc(u8, 16384) catch {
+        allocator.free(tls_read_buf);
+        allocator.free(io_write_buf);
+        allocator.free(io_read_buf);
+        allocator.destroy(ts);
+        return ConnectError.OutOfMemory;
+    };
+    errdefer allocator.free(tls_write_buf);
+
+    // Load CA certificates for verification
+    ts.ca_bundle = .{};
+    ts.allocator = allocator;
+    ts.tls_read_buf = tls_read_buf;
+    ts.tls_write_buf = tls_write_buf;
+    ts.io_read_buf = io_read_buf;
+    ts.io_write_buf = io_write_buf;
+
+    if (verify) {
+        ts.ca_bundle.rescan(allocator) catch {
+            allocator.free(tls_write_buf);
+            allocator.free(tls_read_buf);
+            allocator.free(io_write_buf);
+            allocator.free(io_read_buf);
+            allocator.destroy(ts);
+            return ConnectError.HandshakeFailed;
+        };
+    }
+
+    // Wrap socket in std.net.Stream reader/writer
+    ts.net_stream = .{ .handle = self.socket };
+    ts.net_reader = ts.net_stream.reader(io_read_buf);
+    ts.net_writer = ts.net_stream.writer(io_write_buf);
+
+    // Perform TLS handshake
+    ts.tls_client = tls.Client.init(
+        ts.net_reader.interface(),
+        &ts.net_writer.interface,
+        .{
+            .host = if (verify) .{ .explicit = host } else .no_verification,
+            .ca = if (verify) .{ .bundle = ts.ca_bundle } else .no_verification,
+            .read_buffer = tls_read_buf,
+            .write_buffer = tls_write_buf,
+        },
+    ) catch {
+        if (verify) ts.ca_bundle.deinit(allocator);
+        allocator.free(tls_write_buf);
+        allocator.free(tls_read_buf);
+        allocator.free(io_write_buf);
+        allocator.free(io_read_buf);
+        allocator.destroy(ts);
+        return ConnectError.HandshakeFailed;
+    };
+
+    self.tls_state = ts;
+    self.is_tls = true;
+
+    // Clear any buffered data from pre-TLS reads
+    self.read_start = 0;
+    self.read_end = 0;
+    self.write_pos = 0;
 }
 
 /// Set a receive timeout on the socket (milliseconds, 0 = no timeout).
@@ -176,6 +272,39 @@ pub fn setReadTimeout(self: *Connection, timeout_ms: u32) void {
         .tv_usec = @intCast(@as(u64, timeout_ms % 1000) * 1000),
     };
     posix.setsockopt(self.socket, posix.SOL.SOCKET, SO_RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+}
+
+// ── Abstracted read/write paths ──
+
+/// Read bytes from the connection (TLS-aware).
+fn recvBytes(self: *Connection, buf: []u8) ReadError!usize {
+    if (self.tls_state) |ts| {
+        // Read decrypted data through TLS client
+        const n = ts.tls_client.reader.readSliceShort(buf) catch return ReadError.ConnectionClosed;
+        return n;
+    } else {
+        const n = posix.recv(self.socket, buf, 0) catch |err| switch (err) {
+            error.WouldBlock => return ReadError.WouldBlock,
+            else => return ReadError.ConnectionClosed,
+        };
+        if (n == 0) return ReadError.ConnectionClosed;
+        return n;
+    }
+}
+
+/// Write bytes to the connection (TLS-aware).
+fn sendBytes(self: *Connection, data: []const u8) WriteError!void {
+    if (self.tls_state) |ts| {
+        ts.tls_client.writer.writeAll(data) catch return WriteError.ConnectionClosed;
+        ts.tls_client.writer.flush() catch return WriteError.ConnectionClosed;
+    } else {
+        var sent: usize = 0;
+        while (sent < data.len) {
+            const n = posix.send(self.socket, data[sent..], 0) catch return WriteError.ConnectionClosed;
+            if (n == 0) return WriteError.ConnectionClosed;
+            sent += n;
+        }
+    }
 }
 
 /// Read a line from the connection (terminated by \r\n).
@@ -205,11 +334,7 @@ pub fn readLine(self: *Connection) ReadError![]const u8 {
             return ReadError.Overflow;
         }
 
-        const n = posix.recv(self.socket, self.read_buf[self.read_end..], 0) catch |err| switch (err) {
-            error.WouldBlock => return ReadError.WouldBlock,
-            else => return ReadError.ConnectionClosed,
-        };
-        if (n == 0) return ReadError.ConnectionClosed;
+        const n = try self.recvBytes(self.read_buf[self.read_end..]);
         self.read_end += n;
     }
 }
@@ -233,11 +358,7 @@ pub fn readExact(self: *Connection, len: usize) ReadError![]const u8 {
             return ReadError.Overflow;
         }
 
-        const n = posix.recv(self.socket, self.read_buf[self.read_end..], 0) catch |err| switch (err) {
-            error.WouldBlock => return ReadError.WouldBlock,
-            else => return ReadError.ConnectionClosed,
-        };
-        if (n == 0) return ReadError.ConnectionClosed;
+        const n = try self.recvBytes(self.read_buf[self.read_end..]);
         self.read_end += n;
     }
 
@@ -251,7 +372,7 @@ pub fn write(self: *Connection, data: []const u8) WriteError!void {
     if (data.len > WRITE_BUF_SIZE - self.write_pos) {
         try self.flush();
         if (data.len > WRITE_BUF_SIZE) {
-            try self.sendAll(data);
+            try self.sendBytes(data);
             return;
         }
     }
@@ -262,18 +383,8 @@ pub fn write(self: *Connection, data: []const u8) WriteError!void {
 /// Flush the write buffer to the socket.
 pub fn flush(self: *Connection) WriteError!void {
     if (self.write_pos == 0) return;
-    try self.sendAll(self.write_buf[0..self.write_pos]);
+    try self.sendBytes(self.write_buf[0..self.write_pos]);
     self.write_pos = 0;
-}
-
-fn sendAll(self: *Connection, data: []const u8) WriteError!void {
-    if (!self.connected) return WriteError.ConnectionClosed;
-    var sent: usize = 0;
-    while (sent < data.len) {
-        const n = posix.send(self.socket, data[sent..], 0) catch return WriteError.ConnectionClosed;
-        if (n == 0) return WriteError.ConnectionClosed;
-        sent += n;
-    }
 }
 
 /// Result of readExactAlloc — either a zero-copy slice into read_buf
@@ -316,11 +427,7 @@ pub fn readExactAlloc(self: *Connection, allocator: Allocator, len: usize) (Read
 
     // Recv remaining directly into allocated buffer
     while (filled < len) {
-        const n = posix.recv(self.socket, buf[filled..len], 0) catch |err| switch (err) {
-            error.WouldBlock => return ReadError.WouldBlock,
-            else => return ReadError.ConnectionClosed,
-        };
-        if (n == 0) return ReadError.ConnectionClosed;
+        const n = try self.recvBytes(buf[filled..len]);
         filled += n;
     }
 
@@ -336,11 +443,7 @@ pub fn readExactAlloc(self: *Connection, allocator: Allocator, len: usize) (Read
     // Recv any remaining \r\n bytes
     while (crlf_consumed < 2) {
         var tmp: [2]u8 = undefined;
-        const n = posix.recv(self.socket, tmp[0 .. 2 - crlf_consumed], 0) catch |err| switch (err) {
-            error.WouldBlock => return ReadError.WouldBlock,
-            else => return ReadError.ConnectionClosed,
-        };
-        if (n == 0) return ReadError.ConnectionClosed;
+        const n = try self.recvBytes(tmp[0 .. 2 - crlf_consumed]);
         crlf_consumed += n;
     }
 

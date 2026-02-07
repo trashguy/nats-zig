@@ -24,6 +24,7 @@ pub const ConnectOptions = struct {
     reconnect_wait_ms: u32 = 2_000,
     max_payload: u32 = 1_048_576,
     tls_required: bool = false,
+    tls_verify: bool = true,
     allow_reconnect: bool = true,
 };
 
@@ -383,7 +384,7 @@ fn doConnect(self: *Client) Error!void {
             (if (self.server_info) |si| si.tls_required else false);
 
         if (need_tls) {
-            self.conn.upgradeTls(url.host) catch {
+            self.conn.upgradeTls(self.allocator, url.host, self.opts.tls_verify) catch {
                 self.conn.disconnect();
                 continue;
             };
