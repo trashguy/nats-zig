@@ -162,7 +162,11 @@ pub fn upgradeTls(self: *Connection, host: []const u8) ConnectError!void {
 /// Set a receive timeout on the socket (milliseconds, 0 = no timeout).
 pub fn setReadTimeout(self: *Connection, timeout_ms: u32) void {
     if (!self.connected) return;
-    const SO_RCVTIMEO = 20;
+    // Use platform-correct SO_RCVTIMEO (Linux=20, macOS=4102, etc.)
+    const SO_RCVTIMEO = if (@hasDecl(posix.SO, "RCVTIMEO"))
+        posix.SO.RCVTIMEO
+    else
+        20; // Linux fallback
     const timeval = extern struct {
         tv_sec: i64,
         tv_usec: i64,
@@ -270,6 +274,77 @@ fn sendAll(self: *Connection, data: []const u8) WriteError!void {
         if (n == 0) return WriteError.ConnectionClosed;
         sent += n;
     }
+}
+
+/// Result of readExactAlloc — either a zero-copy slice into read_buf
+/// or an allocated buffer for payloads larger than READ_BUF_SIZE.
+pub const ReadResult = struct {
+    data: []const u8,
+    allocated: ?[]u8 = null,
+
+    pub fn free(self: ReadResult, allocator: Allocator) void {
+        if (self.allocated) |buf| allocator.free(buf);
+    }
+};
+
+/// Read exactly `len` bytes plus trailing \r\n, supporting payloads larger than READ_BUF_SIZE.
+/// For small payloads, returns a zero-copy slice into the internal read buffer.
+/// For large payloads, allocates a buffer and reads directly into it.
+pub fn readExactAlloc(self: *Connection, allocator: Allocator, len: usize) (ReadError || Allocator.Error)!ReadResult {
+    const total_needed = len + 2; // payload + \r\n
+
+    // Small payload: use existing zero-copy path
+    if (total_needed <= READ_BUF_SIZE) {
+        const data = try self.readExact(len);
+        return .{ .data = data };
+    }
+
+    // Large payload: allocate buffer, copy buffered data, recv rest
+    const buf = try allocator.alloc(u8, len);
+    errdefer allocator.free(buf);
+
+    var filled: usize = 0;
+
+    // Copy any already-buffered data
+    const buffered = self.read_end - self.read_start;
+    if (buffered > 0) {
+        const to_copy = @min(buffered, len);
+        @memcpy(buf[0..to_copy], self.read_buf[self.read_start .. self.read_start + to_copy]);
+        self.read_start += to_copy;
+        filled = to_copy;
+    }
+
+    // Recv remaining directly into allocated buffer
+    while (filled < len) {
+        const n = posix.recv(self.socket, buf[filled..len], 0) catch |err| switch (err) {
+            error.WouldBlock => return ReadError.WouldBlock,
+            else => return ReadError.ConnectionClosed,
+        };
+        if (n == 0) return ReadError.ConnectionClosed;
+        filled += n;
+    }
+
+    // Consume trailing \r\n
+    var crlf_consumed: usize = 0;
+    // Check if some of the trailing \r\n is already buffered
+    const remaining_buffered = self.read_end - self.read_start;
+    if (remaining_buffered > 0) {
+        const skip = @min(remaining_buffered, 2);
+        self.read_start += skip;
+        crlf_consumed = skip;
+    }
+    // Recv any remaining \r\n bytes
+    while (crlf_consumed < 2) {
+        var tmp: [2]u8 = undefined;
+        const n = posix.recv(self.socket, tmp[0 .. 2 - crlf_consumed], 0) catch |err| switch (err) {
+            error.WouldBlock => return ReadError.WouldBlock,
+            else => return ReadError.ConnectionClosed,
+        };
+        if (n == 0) return ReadError.ConnectionClosed;
+        crlf_consumed += n;
+    }
+
+    return .{ .data = buf, .allocated = buf };
 }
 
 /// Check if there is buffered data available to read without blocking.

@@ -12,7 +12,8 @@ test "parse sequence: INFO → MSG with payload" {
         \\INFO {"server_id":"test-server","version":"2.10.0","proto":1,"max_payload":1048576,"headers":true}
     );
     try std.testing.expect(info_result != null);
-    try std.testing.expect(info_result.? == .info);
+    var info = info_result.?.info;
+    defer info.deinit();
 
     // Step 2: MSG header
     const msg_header = try parser.parse("MSG foo.bar 1 13");

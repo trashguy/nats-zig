@@ -46,6 +46,15 @@ pub fn getAll(self: *const Headers, allocator: Allocator, key: []const u8) ![]co
 pub fn parse(allocator: Allocator, data: []const u8) !Headers {
     var headers = Headers{};
     var entries: std.ArrayListUnmanaged(Entry) = .{};
+    errdefer {
+        for (entries.items) |entry| {
+            allocator.free(entry.key);
+            allocator.free(entry.value);
+        }
+        entries.deinit(allocator);
+        if (headers.description) |d| allocator.free(d);
+        if (headers.status) |s| allocator.free(s);
+    }
 
     // Find first \r\n — the status line
     const first_line_end = std.mem.indexOf(u8, data, "\r\n") orelse return error.InvalidHeaders;
@@ -78,13 +87,15 @@ pub fn parse(allocator: Allocator, data: []const u8) !Headers {
 
         // Parse "Key: Value"
         const colon_idx = std.mem.indexOf(u8, line, ":") orelse continue;
-        const key = std.mem.trim(u8, line[0..colon_idx], " ");
-        const value = std.mem.trim(u8, line[colon_idx + 1 ..], " ");
+        const key_raw = std.mem.trim(u8, line[0..colon_idx], " ");
+        const value_raw = std.mem.trim(u8, line[colon_idx + 1 ..], " ");
 
-        try entries.append(allocator, .{
-            .key = try allocator.dupe(u8, key),
-            .value = try allocator.dupe(u8, value),
-        });
+        const key = try allocator.dupe(u8, key_raw);
+        const value = allocator.dupe(u8, value_raw) catch |err| {
+            allocator.free(key);
+            return err;
+        };
+        try entries.append(allocator, .{ .key = key, .value = value });
     }
 
     headers.entries = try entries.toOwnedSlice(allocator);

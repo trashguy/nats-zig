@@ -117,12 +117,22 @@ pub const Context = struct {
         const inbox_arr = self.client.sub_mgr.newInbox() catch return Error.OutOfMemory;
         const inbox = inbox_arr[0..39];
 
-        const inbox_sub = self.client.subscribe(inbox, .{}) catch return Error.OutOfMemory;
+        const owned_stream = self.allocator.dupe(u8, stream) catch return Error.OutOfMemory;
+        const owned_consumer = self.allocator.dupe(u8, consumer) catch {
+            self.allocator.free(owned_stream);
+            return Error.OutOfMemory;
+        };
+
+        const inbox_sub = self.client.subscribe(inbox, .{}) catch {
+            self.allocator.free(owned_stream);
+            self.allocator.free(owned_consumer);
+            return Error.OutOfMemory;
+        };
 
         return PullSubscription{
             .ctx = self,
-            .stream = stream,
-            .consumer = consumer,
+            .stream = owned_stream,
+            .consumer = owned_consumer,
             .inbox_sub = inbox_sub,
         };
     }
@@ -139,9 +149,14 @@ pub const Error = error{
 } || Client.Error;
 
 pub const PubAck = struct {
-    stream: []const u8 = "",
+    stream_buf: [64]u8 = undefined,
+    stream_len: u8 = 0,
     seq: u64 = 0,
     duplicate: bool = false,
+
+    pub fn stream(self: *const PubAck) []const u8 {
+        return self.stream_buf[0..self.stream_len];
+    }
 };
 
 pub const StreamConfig = struct {
@@ -153,6 +168,7 @@ pub const StreamConfig = struct {
     max_bytes: i64 = -1,
     max_age_ns: i64 = 0,
     max_msg_size: i32 = -1,
+    max_msgs_per_subject: i64 = -1,
     storage: Storage = .file,
     num_replicas: u32 = 1,
     discard: Discard = .old,
@@ -223,7 +239,11 @@ pub const PullSubscription = struct {
             self.ctx.client.processIncoming() catch break;
         }
 
-        return messages.toOwnedSlice(self.ctx.allocator) catch return Error.OutOfMemory;
+        return messages.toOwnedSlice(self.ctx.allocator) catch {
+            for (messages.items) |*m| m.deinit();
+            messages.deinit(self.ctx.allocator);
+            return Error.OutOfMemory;
+        };
     }
 
     /// Acknowledge a message (publish empty to the ack subject).
@@ -240,20 +260,42 @@ pub const PullSubscription = struct {
         }
     }
 
-    /// Close the pull subscription.
+    /// Close the pull subscription and free owned resources.
     pub fn close(self: *PullSubscription) void {
         self.ctx.client.unsubscribe(self.inbox_sub) catch {};
+        self.ctx.allocator.free(self.stream);
+        self.ctx.allocator.free(self.consumer);
     }
 };
 
 // ── JSON serialization helpers ──
+
+/// Escape a string for safe embedding in a JSON value.
+fn writeEscaped(writer: anytype, value: []const u8) !void {
+    for (value) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (c < 0x20) {
+                    try std.fmt.format(writer, "\\u{x:0>4}", .{@as(u16, c)});
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
+}
 
 fn serializeStreamConfig(buf: []u8, config: StreamConfig) ![]const u8 {
     var stream = std.io.fixedBufferStream(buf);
     const w = stream.writer();
 
     try w.writeAll("{\"name\":\"");
-    try w.writeAll(config.name);
+    try writeEscaped(w, config.name);
     try w.writeAll("\"");
 
     if (config.subjects.len > 0) {
@@ -261,7 +303,7 @@ fn serializeStreamConfig(buf: []u8, config: StreamConfig) ![]const u8 {
         for (config.subjects, 0..) |subject, i| {
             if (i > 0) try w.writeAll(",");
             try w.writeAll("\"");
-            try w.writeAll(subject);
+            try writeEscaped(w, subject);
             try w.writeAll("\"");
         }
         try w.writeAll("]");
@@ -294,6 +336,7 @@ fn serializeStreamConfig(buf: []u8, config: StreamConfig) ![]const u8 {
     try std.fmt.format(w, ",\"max_bytes\":{d}", .{config.max_bytes});
     try std.fmt.format(w, ",\"max_age\":{d}", .{config.max_age_ns});
     try std.fmt.format(w, ",\"max_msg_size\":{d}", .{config.max_msg_size});
+    try std.fmt.format(w, ",\"max_msgs_per_subject\":{d}", .{config.max_msgs_per_subject});
     try std.fmt.format(w, ",\"num_replicas\":{d}", .{config.num_replicas});
 
     try w.writeAll("}");
@@ -309,7 +352,7 @@ fn serializeConsumerConfig(buf: []u8, config: ConsumerConfig) ![]const u8 {
 
     if (config.durable_name) |name| {
         try w.writeAll("\"durable_name\":\"");
-        try w.writeAll(name);
+        try writeEscaped(w, name);
         try w.writeAll("\"");
         first = false;
     }
@@ -317,7 +360,7 @@ fn serializeConsumerConfig(buf: []u8, config: ConsumerConfig) ![]const u8 {
     if (config.filter_subject) |subj| {
         if (!first) try w.writeAll(",");
         try w.writeAll("\"filter_subject\":\"");
-        try w.writeAll(subj);
+        try writeEscaped(w, subj);
         try w.writeAll("\"");
         first = false;
     }
@@ -325,7 +368,7 @@ fn serializeConsumerConfig(buf: []u8, config: ConsumerConfig) ![]const u8 {
     if (config.deliver_subject) |subj| {
         if (!first) try w.writeAll(",");
         try w.writeAll("\"deliver_subject\":\"");
-        try w.writeAll(subj);
+        try writeEscaped(w, subj);
         try w.writeAll("\"");
         first = false;
     }
@@ -353,9 +396,16 @@ fn parsePubAck(data: []const u8) Error!PubAck {
 
     var ack = PubAck{};
 
-    // Parse "seq":N
+    // Parse "stream":"name"
+    if (extractJsonString(data, "stream")) |name| {
+        const len = @min(name.len, ack.stream_buf.len);
+        @memcpy(ack.stream_buf[0..len], name[0..len]);
+        ack.stream_len = @intCast(len);
+    }
+
+    // Parse "seq":N (safe cast — negative seq from server is treated as 0)
     if (extractJsonInt(data, "seq")) |seq| {
-        ack.seq = @intCast(seq);
+        ack.seq = std.math.cast(u64, seq) orelse 0;
     }
 
     // Parse "duplicate":true/false
@@ -371,13 +421,13 @@ fn parseStreamInfo(data: []const u8) Error!StreamInfo {
 
     var info = StreamInfo{};
 
-    // Look for "state" object fields
+    // Look for "state" object fields (safe cast — negative values treated as 0)
     if (std.mem.indexOf(u8, data, "\"state\"")) |state_idx| {
         const state_data = data[state_idx..];
-        if (extractJsonInt(state_data, "messages")) |v| info.messages = @intCast(v);
-        if (extractJsonInt(state_data, "bytes")) |v| info.bytes = @intCast(v);
-        if (extractJsonInt(state_data, "first_seq")) |v| info.first_seq = @intCast(v);
-        if (extractJsonInt(state_data, "last_seq")) |v| info.last_seq = @intCast(v);
+        if (extractJsonInt(state_data, "messages")) |v| info.messages = std.math.cast(u64, v) orelse 0;
+        if (extractJsonInt(state_data, "bytes")) |v| info.bytes = std.math.cast(u64, v) orelse 0;
+        if (extractJsonInt(state_data, "first_seq")) |v| info.first_seq = std.math.cast(u64, v) orelse 0;
+        if (extractJsonInt(state_data, "last_seq")) |v| info.last_seq = std.math.cast(u64, v) orelse 0;
     }
 
     return info;
@@ -387,15 +437,20 @@ fn parseConsumerInfo(data: []const u8) Error!ConsumerInfo {
     if (checkJsError(data)) |err| return err;
 
     var info = ConsumerInfo{};
-    if (extractJsonInt(data, "num_pending")) |v| info.num_pending = @intCast(v);
-    if (extractJsonInt(data, "num_ack_pending")) |v| info.num_ack_pending = @intCast(v);
+    if (extractJsonInt(data, "num_pending")) |v| info.num_pending = std.math.cast(u64, v) orelse 0;
+    if (extractJsonInt(data, "num_ack_pending")) |v| info.num_ack_pending = std.math.cast(u64, v) orelse 0;
 
     return info;
 }
 
 /// Check for a JetStream error in the JSON response.
+/// Looks for `"error":{` pattern to avoid false positives on data containing the word "error".
 pub fn checkJsError(data: []const u8) ?Error {
-    if (std.mem.indexOf(u8, data, "\"error\"")) |_| {
+    // Match "error":{ with optional whitespace — avoids matching string values like "error_handler"
+    const has_error = std.mem.indexOf(u8, data, "\"error\":{") != null or
+        std.mem.indexOf(u8, data, "\"error\" :{") != null or
+        std.mem.indexOf(u8, data, "\"error\": {") != null;
+    if (has_error) {
         // Check error code
         if (extractJsonInt(data, "err_code")) |code| {
             return switch (code) {
@@ -413,6 +468,22 @@ pub fn checkJsError(data: []const u8) ?Error {
         return Error.JetStreamError;
     }
     return null;
+}
+
+/// Simple JSON string extraction: find "key":"value" and return the value (without quotes).
+/// Does not handle escaped quotes inside the value.
+pub fn extractJsonString(data: []const u8, key: []const u8) ?[]const u8 {
+    var search_buf: [128]u8 = undefined;
+    const search = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{key}) catch return null;
+
+    const idx = std.mem.indexOf(u8, data, search) orelse return null;
+    const after = data[idx + search.len ..];
+    const trimmed = std.mem.trimLeft(u8, after, " ");
+
+    if (trimmed.len == 0 or trimmed[0] != '"') return null;
+    const str_start = trimmed[1..];
+    const end_quote = std.mem.indexOf(u8, str_start, "\"") orelse return null;
+    return str_start[0..end_quote];
 }
 
 /// Simple JSON integer extraction: find "key":N and parse N.
@@ -462,12 +533,14 @@ test "serialize consumer config" {
 
 test "parse pub ack" {
     const ack = try parsePubAck("{\"stream\":\"ORDERS\",\"seq\":42}");
+    try std.testing.expectEqualStrings("ORDERS", ack.stream());
     try std.testing.expect(ack.seq == 42);
     try std.testing.expect(ack.duplicate == false);
 }
 
 test "parse pub ack duplicate" {
     const ack = try parsePubAck("{\"stream\":\"ORDERS\",\"seq\":42,\"duplicate\":true}");
+    try std.testing.expectEqualStrings("ORDERS", ack.stream());
     try std.testing.expect(ack.seq == 42);
     try std.testing.expect(ack.duplicate == true);
 }
@@ -505,4 +578,11 @@ test "extract json int" {
     try std.testing.expect(extractJsonInt("{\"seq\":42}", "seq").? == 42);
     try std.testing.expect(extractJsonInt("{\"seq\":-1}", "seq").? == -1);
     try std.testing.expect(extractJsonInt("{\"foo\":\"bar\"}", "seq") == null);
+}
+
+test "extract json string" {
+    try std.testing.expectEqualStrings("hello", extractJsonString("{\"data\":\"hello\"}", "data").?);
+    try std.testing.expectEqualStrings("aGVsbG8=", extractJsonString("{\"data\":\"aGVsbG8=\"}", "data").?);
+    try std.testing.expect(extractJsonString("{\"seq\":42}", "data") == null);
+    try std.testing.expect(extractJsonString("{\"data\":42}", "data") == null);
 }

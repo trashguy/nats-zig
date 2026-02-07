@@ -25,6 +25,12 @@ pub const MockServer = struct {
         const one: u32 = 1;
         posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
 
+        // Set accept timeout so serverLoop can check running flag periodically
+        const SO_RCVTIMEO = if (@hasDecl(posix.SO, "RCVTIMEO")) posix.SO.RCVTIMEO else 20;
+        const timeval = extern struct { tv_sec: i64, tv_usec: i64 };
+        const tv = timeval{ .tv_sec = 0, .tv_usec = 200_000 }; // 200ms
+        posix.setsockopt(listener, posix.SOL.SOCKET, SO_RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+
         const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, requested_port);
         try posix.bind(listener, &addr.any, addr.getOsSockLen());
         try posix.listen(listener, 1);
@@ -66,8 +72,9 @@ pub const MockServer = struct {
 
     fn serverLoop(self: *Self) void {
         while (self.running.load(.acquire)) {
-            const client_sock = posix.accept(self.listener, null, null, posix.SOCK.CLOEXEC) catch {
-                break;
+            const client_sock = posix.accept(self.listener, null, null, posix.SOCK.CLOEXEC) catch |err| switch (err) {
+                error.WouldBlock => continue, // timeout, check running flag
+                else => break,
             };
 
             self.handleClient(client_sock) catch {};

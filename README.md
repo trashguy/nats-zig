@@ -6,19 +6,40 @@ Requires Zig 0.14+.
 
 ## Features
 
-- Core pub/sub messaging
-- Request/reply pattern
-- Queue group subscriptions
-- NATS headers (HMSG)
+### Core NATS
+- Pub/sub messaging with subject validation
+- Request/reply pattern with auto-generated inboxes
+- Queue group subscriptions for load balancing
+- NATS headers (HMSG/HPUB)
 - Wire protocol parser/serializer
-- Buffered TCP I/O
+- Buffered TCP I/O (64KB read/write buffers)
 
-### Planned (future sessions)
+### Connection Management
+- Automatic reconnection with exponential backoff and jitter
+- Server mesh discovery via `connect_urls`
+- Ping/pong heartbeats with configurable intervals
+- Token and username/password authentication
+- URL-embedded credentials (`nats://user:pass@host`)
+- Connection status tracking (disconnected, connected, reconnecting, draining)
 
-- Reconnection with exponential backoff
-- TLS via `std.crypto.tls`
-- JetStream (streams, consumers, publish+ack)
-- KeyValue store (get/put/delete/watch)
+### JetStream
+- Stream CRUD (create, update, delete, info)
+- Consumer management (create, delete, durable and ephemeral)
+- Publish with acknowledgment (`PubAck` with stream, sequence, duplicate flag)
+- Pull subscriptions with batch fetch
+- Message ack/nak
+- Configurable retention, storage, replication, and discard policies
+
+### KeyValue Store
+- Bucket create, open, and destroy
+- Key operations: get, put, delete
+- Revision tracking via JetStream sequence numbers
+- Backed by JetStream streams (`KV_<bucket>`)
+- Configurable history, TTL, max value size, storage, and replication
+
+### Planned
+- TLS via `std.crypto.tls` (infrastructure in place, upgrade not yet wired)
+- KeyValue watch
 
 ## Usage
 
@@ -86,6 +107,49 @@ std.debug.print("answer: {s}\n", .{reply.payload.?});
 const sub = try client.subscribe("tasks.>", .{ .queue_group = "workers" });
 ```
 
+### JetStream
+
+```zig
+var js = client.jetStream();
+
+// Create a stream
+try js.createStream(.{ .name = "ORDERS", .subjects = &.{"orders.>"} });
+
+// Publish with ack
+const ack = try js.publish("orders.new", "order-data");
+
+// Create a consumer and fetch messages
+try js.createConsumer("ORDERS", .{ .durable_name = "processor" });
+var pull = try js.pullSubscribe("ORDERS", "processor");
+defer pull.close();
+
+const msgs = try pull.fetch(10, 5000);
+for (msgs) |*msg| {
+    defer msg.deinit();
+    try pull.ack(msg);
+}
+```
+
+### KeyValue Store
+
+```zig
+var js = client.jetStream();
+
+// Create a bucket
+var kv = try nats.KeyValue.create(js, "config", .{});
+defer kv.destroy();
+
+// Put and get values
+const rev = try kv.put("app.setting", "value");
+if (try kv.get("app.setting")) |entry| {
+    defer entry.deinit();
+    std.debug.print("value: {s}, revision: {d}\n", .{ entry.value, entry.revision });
+}
+
+// Delete a key
+try kv.delete("app.setting");
+```
+
 ## Building
 
 ```bash
@@ -100,7 +164,12 @@ Client (public API)
 ├── publish(), subscribe(), request()
 ├── Subscription Manager (sid allocation, dispatch)
 ├── Protocol (wire parser + serializer)
-└── Connection (TCP, buffered I/O)
+├── Connection (TCP, buffered I/O, reconnect)
+├── JetStream (streams, consumers, pull subscriptions)
+│   └── PullSubscription (fetch, ack, nak)
+├── KeyValue (buckets, get/put/delete)
+│   └── backed by JetStream streams
+└── Headers (HMSG/HPUB support)
 ```
 
 ## License

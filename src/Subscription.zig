@@ -79,7 +79,11 @@ pub fn removeSubscription(self: *SubscriptionManager, sid: u64) void {
 
 /// Dispatch an incoming MSG to the matching subscription.
 pub fn dispatch(self: *SubscriptionManager, msg: Protocol.Msg) !void {
-    const sid_int = std.fmt.parseInt(u64, msg.sid, 10) catch return;
+    const sid_int = std.fmt.parseInt(u64, msg.sid, 10) catch {
+        var m = msg;
+        m.deinit();
+        return;
+    };
 
     if (self.subs.get(sid_int)) |sub| {
         sub.received += 1;
@@ -131,9 +135,7 @@ pub fn newInbox(self: *SubscriptionManager) ![44]u8 {
     // Generate a random suffix
     var rand_buf: [24]u8 = undefined;
     std.crypto.random.bytes(&rand_buf);
-    const encoded = std.base64.url_safe_no_pad.Encoder.encode(buf[7..39], rand_buf[0..24]);
-    _ = encoded;
-    buf[39] = 0; // null-terminate just in case, but length is fixed
+    _ = std.base64.url_safe_no_pad.Encoder.encode(buf[7..39], rand_buf[0..24]);
 
     return buf;
 }

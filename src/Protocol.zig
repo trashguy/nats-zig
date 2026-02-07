@@ -24,6 +24,20 @@ pub const ServerInfo = struct {
     client_id: u64 = 0,
     tls_required: bool = false,
     connect_urls: ?[]const []const u8 = null,
+
+    /// Internal: arena that owns the memory for string fields and connect_urls.
+    _arena: ?*std.heap.ArenaAllocator = null,
+
+    /// Free memory owned by this ServerInfo. Safe to call multiple times.
+    pub fn deinit(self: *ServerInfo) void {
+        if (self._arena) |arena| {
+            const child = arena.child_allocator;
+            arena.deinit();
+            child.destroy(arena);
+        }
+        self._arena = null;
+        self.connect_urls = null;
+    }
 };
 
 pub const Msg = struct {
@@ -119,7 +133,7 @@ pub const Parser = struct {
 
         if (std.ascii.startsWithIgnoreCase(line, "INFO ") or std.ascii.startsWithIgnoreCase(line, "INFO\t")) {
             const json_str = std.mem.trimLeft(u8, line[4..], " \t");
-            return .{ .info = parseServerInfo(json_str) };
+            return .{ .info = parseServerInfo(self.allocator, json_str) };
         }
 
         if (std.ascii.startsWithIgnoreCase(line, "MSG ")) {
@@ -271,33 +285,44 @@ pub const Parser = struct {
     }
 };
 
-fn parseServerInfo(json_str: []const u8) ServerInfo {
+fn parseServerInfo(allocator: Allocator, json_str: []const u8) ServerInfo {
     var info = ServerInfo{};
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, json_str, .{}) catch return info;
+
+    // Create a dedicated arena for ServerInfo string data
+    const arena_ptr = allocator.create(std.heap.ArenaAllocator) catch return info;
+    arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
+    info._arena = arena_ptr;
+    const aa = arena_ptr.allocator();
+
+    // Parse JSON temporarily — we'll dupe strings into our arena
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch return info;
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return info,
+    };
 
     if (obj.get("server_id")) |v| {
-        if (v == .string) info.server_id = v.string;
+        if (v == .string) info.server_id = aa.dupe(u8, v.string) catch "";
     }
     if (obj.get("server_name")) |v| {
-        if (v == .string) info.server_name = v.string;
+        if (v == .string) info.server_name = aa.dupe(u8, v.string) catch "";
     }
     if (obj.get("version")) |v| {
-        if (v == .string) info.version = v.string;
+        if (v == .string) info.version = aa.dupe(u8, v.string) catch "";
     }
     if (obj.get("proto")) |v| {
         if (v == .integer) info.proto = v.integer;
     }
     if (obj.get("host")) |v| {
-        if (v == .string) info.host = v.string;
+        if (v == .string) info.host = aa.dupe(u8, v.string) catch "";
     }
     if (obj.get("port")) |v| {
-        if (v == .integer) info.port = @intCast(v.integer);
+        if (v == .integer) info.port = std.math.cast(u16, v.integer) orelse 4222;
     }
     if (obj.get("max_payload")) |v| {
-        if (v == .integer) info.max_payload = @intCast(v.integer);
+        if (v == .integer) info.max_payload = std.math.cast(u32, v.integer) orelse 1_048_576;
     }
     if (obj.get("headers")) |v| {
         if (v == .bool) info.headers = v.bool;
@@ -306,29 +331,27 @@ fn parseServerInfo(json_str: []const u8) ServerInfo {
         if (v == .bool) info.jetstream = v.bool;
     }
     if (obj.get("client_id")) |v| {
-        if (v == .integer) info.client_id = @intCast(v.integer);
+        if (v == .integer) info.client_id = std.math.cast(u64, v.integer) orelse 0;
     }
     if (obj.get("tls_required")) |v| {
         if (v == .bool) info.tls_required = v.bool;
     }
 
-    // Parse connect_urls array
+    // Parse connect_urls array — dupe everything into our arena
     if (obj.get("connect_urls")) |v| {
         if (v == .array) {
             const arr = v.array;
             if (arr.items.len > 0) {
-                const urls = std.heap.page_allocator.alloc([]const u8, arr.items.len) catch return info;
+                const urls = aa.alloc([]const u8, arr.items.len) catch return info;
                 var count: usize = 0;
                 for (arr.items) |item| {
                     if (item == .string) {
-                        urls[count] = std.heap.page_allocator.dupe(u8, item.string) catch continue;
+                        urls[count] = aa.dupe(u8, item.string) catch continue;
                         count += 1;
                     }
                 }
                 if (count > 0) {
                     info.connect_urls = urls[0..count];
-                } else {
-                    std.heap.page_allocator.free(urls);
                 }
             }
         }
@@ -490,8 +513,28 @@ fn writeJsonStr(writer: anytype, key: []const u8, value: []const u8, first: bool
     try writer.writeAll("\"");
     try writer.writeAll(key);
     try writer.writeAll("\":\"");
-    try writer.writeAll(value);
+    try writeEscapedJson(writer, value);
     try writer.writeAll("\"");
+}
+
+/// Escape a string for safe embedding in a JSON value.
+fn writeEscapedJson(writer: anytype, value: []const u8) !void {
+    for (value) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (c < 0x20) {
+                    try std.fmt.format(writer, "\\u{x:0>4}", .{@as(u16, c)});
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
 }
 
 fn writeJsonInt(writer: anytype, key: []const u8, value: i64, first: bool) !void {
@@ -551,15 +594,15 @@ test "parse INFO" {
         \\INFO {"server_id":"test","version":"2.10.0","proto":1,"max_payload":1048576,"headers":true,"jetstream":true}
     );
     try std.testing.expect(result != null);
-    switch (result.?) {
-        .info => |info| {
-            try std.testing.expect(info.proto == 1);
-            try std.testing.expect(info.max_payload == 1_048_576);
-            try std.testing.expect(info.headers == true);
-            try std.testing.expect(info.jetstream == true);
-        },
+    var info: ServerInfo = switch (result.?) {
+        .info => |i| i,
         else => return error.UnexpectedResult,
-    }
+    };
+    defer info.deinit();
+    try std.testing.expect(info.proto == 1);
+    try std.testing.expect(info.max_payload == 1_048_576);
+    try std.testing.expect(info.headers == true);
+    try std.testing.expect(info.jetstream == true);
 }
 
 test "parse MSG without reply-to" {
@@ -691,11 +734,11 @@ test "parse INFO with connect_urls" {
         \\INFO {"server_id":"test","version":"2.10.0","proto":1,"connect_urls":["10.0.0.1:4222","10.0.0.2:4222"]}
     );
     try std.testing.expect(result != null);
-    switch (result.?) {
-        .info => |info| {
-            try std.testing.expect(info.connect_urls != null);
-            try std.testing.expect(info.connect_urls.?.len == 2);
-        },
+    var info: ServerInfo = switch (result.?) {
+        .info => |i| i,
         else => return error.UnexpectedResult,
-    }
+    };
+    defer info.deinit();
+    try std.testing.expect(info.connect_urls != null);
+    try std.testing.expect(info.connect_urls.?.len == 2);
 }

@@ -33,6 +33,7 @@ pub const Error = error{
     NoResponders,
     ServerError,
     MaxPayloadExceeded,
+    InvalidSubject,
     OutOfMemory,
     ConnectionFailed,
     ReconnectFailed,
@@ -94,38 +95,80 @@ pub fn close(self: *Client) void {
         self.allocator.free(url);
     }
     self.known_servers.deinit(self.allocator);
+    // Free ServerInfo memory
+    if (self.server_info) |*si| si.deinit();
     self.status = .disconnected;
     self.allocator.destroy(self);
 }
 
+/// Validate a NATS subject for protocol safety (no CRLF, spaces, or null bytes).
+fn validateSubject(subject: []const u8) Error!void {
+    if (subject.len == 0) return Error.InvalidSubject;
+    for (subject) |c| {
+        if (c == '\r' or c == '\n' or c == ' ' or c == '\t' or c == 0) return Error.InvalidSubject;
+    }
+}
+
 /// Publish a message to a subject.
 pub fn publish(self: *Client, subject: []const u8, payload: ?[]const u8) Error!void {
+    try validateSubject(subject);
     try self.publishInner(subject, null, payload);
 }
 
 /// Publish a message with a reply-to subject.
 pub fn publishTo(self: *Client, subject: []const u8, reply_to: []const u8, payload: ?[]const u8) Error!void {
+    try validateSubject(subject);
     try self.publishInner(subject, reply_to, payload);
 }
 
 /// Publish a message with headers.
 pub fn publishMsg(self: *Client, subject: []const u8, reply_to: ?[]const u8, hdrs: ?*const Headers, payload: ?[]const u8) Error!void {
     if (self.status != .connected) return Error.NotConnected;
-
-    var buf: [65536]u8 = undefined;
+    try validateSubject(subject);
 
     if (hdrs) |h| {
-        const formatted = Protocol.fmtHpub(&buf, subject, reply_to, h, payload) catch return Error.MaxPayloadExceeded;
-        self.conn.write(formatted) catch {
-            try self.handleWriteFailure();
-            self.conn.write(formatted) catch return Error.NotConnected;
-        };
+        // Serialize headers (small — 4KB is plenty for NATS headers)
+        var hdr_buf: [4096]u8 = undefined;
+        const hdr_bytes = h.serialize(&hdr_buf) catch return Error.MaxPayloadExceeded;
+        const hdr_len = hdr_bytes.len;
+        const payload_len = if (payload) |p| p.len else 0;
+        const total_len = hdr_len + payload_len;
+
+        const max_payload = if (self.server_info) |si| si.max_payload else self.opts.max_payload;
+        if (total_len > max_payload) return Error.MaxPayloadExceeded;
+
+        // Format just the HPUB header line
+        var line_buf: [1024]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&line_buf);
+        const w = stream.writer();
+        if (reply_to) |rt| {
+            std.fmt.format(w, "HPUB {s} {s} {d} {d}\r\n", .{ subject, rt, hdr_len, total_len }) catch return Error.MaxPayloadExceeded;
+        } else {
+            std.fmt.format(w, "HPUB {s} {d} {d}\r\n", .{ subject, hdr_len, total_len }) catch return Error.MaxPayloadExceeded;
+        }
+
+        try self.writeOrReconnect(stream.getWritten());
+        try self.writeOrReconnect(hdr_bytes);
+        if (payload) |p| try self.writeOrReconnect(p);
+        try self.writeOrReconnect("\r\n");
     } else {
-        const formatted = Protocol.fmtPub(&buf, subject, reply_to, payload) catch return Error.MaxPayloadExceeded;
-        self.conn.write(formatted) catch {
-            try self.handleWriteFailure();
-            self.conn.write(formatted) catch return Error.NotConnected;
-        };
+        // No headers — delegate to publishInner
+        const payload_len = if (payload) |p| p.len else 0;
+        const max_payload = if (self.server_info) |si| si.max_payload else self.opts.max_payload;
+        if (payload_len > max_payload) return Error.MaxPayloadExceeded;
+
+        var line_buf: [1024]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&line_buf);
+        const w = stream.writer();
+        if (reply_to) |rt| {
+            std.fmt.format(w, "PUB {s} {s} {d}\r\n", .{ subject, rt, payload_len }) catch return Error.MaxPayloadExceeded;
+        } else {
+            std.fmt.format(w, "PUB {s} {d}\r\n", .{ subject, payload_len }) catch return Error.MaxPayloadExceeded;
+        }
+
+        try self.writeOrReconnect(stream.getWritten());
+        if (payload) |p| try self.writeOrReconnect(p);
+        try self.writeOrReconnect("\r\n");
     }
     self.conn.flush() catch return Error.NotConnected;
 }
@@ -133,6 +176,7 @@ pub fn publishMsg(self: *Client, subject: []const u8, reply_to: ?[]const u8, hdr
 /// Subscribe to a subject, returning a Subscription handle.
 pub fn subscribe(self: *Client, subject: []const u8, opts: SubscribeOpts) Error!*Subscription {
     if (self.status != .connected) return Error.NotConnected;
+    try validateSubject(subject);
 
     const sub = try self.sub_mgr.addSubscription(subject, opts);
     errdefer self.sub_mgr.removeSubscription(sub.sid);
@@ -257,7 +301,8 @@ pub fn maybeSendPing(self: *Client) Error!void {
     if (self.opts.ping_interval_ms == 0) return;
 
     const now = std.time.nanoTimestamp();
-    const elapsed_ms: u64 = @intCast(@divFloor(now - self.last_ping_time, std.time.ns_per_ms));
+    const diff = @max(now - self.last_ping_time, 0);
+    const elapsed_ms: u64 = @intCast(@divFloor(diff, std.time.ns_per_ms));
 
     if (elapsed_ms >= self.opts.ping_interval_ms) {
         if (self.outstanding_pings >= self.opts.max_outstanding_pings) {
@@ -318,6 +363,7 @@ fn doConnect(self: *Client) Error!void {
         if (info_op) |op| {
             switch (op) {
                 .info => |info| {
+                    if (self.server_info) |*old| old.deinit();
                     self.server_info = info;
                     // Merge connect_urls
                     self.mergeConnectUrls(info);
@@ -409,12 +455,24 @@ fn doConnect(self: *Client) Error!void {
 fn publishInner(self: *Client, subject: []const u8, reply_to: ?[]const u8, payload: ?[]const u8) Error!void {
     if (self.status != .connected) return Error.NotConnected;
 
-    var buf: [65536]u8 = undefined;
-    const formatted = Protocol.fmtPub(&buf, subject, reply_to, payload) catch return Error.MaxPayloadExceeded;
-    self.conn.write(formatted) catch {
-        try self.handleWriteFailure();
-        self.conn.write(formatted) catch return Error.NotConnected;
-    };
+    // Enforce max_payload from server INFO or client config
+    const payload_len = if (payload) |p| p.len else 0;
+    const max_payload = if (self.server_info) |si| si.max_payload else self.opts.max_payload;
+    if (payload_len > max_payload) return Error.MaxPayloadExceeded;
+
+    // Format just the header line — subject + numbers, always small
+    var hdr_buf: [1024]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&hdr_buf);
+    const w = stream.writer();
+    if (reply_to) |rt| {
+        std.fmt.format(w, "PUB {s} {s} {d}\r\n", .{ subject, rt, payload_len }) catch return Error.MaxPayloadExceeded;
+    } else {
+        std.fmt.format(w, "PUB {s} {d}\r\n", .{ subject, payload_len }) catch return Error.MaxPayloadExceeded;
+    }
+
+    try self.writeOrReconnect(stream.getWritten());
+    if (payload) |p| try self.writeOrReconnect(p);
+    try self.writeOrReconnect("\r\n");
     self.conn.flush() catch return Error.NotConnected;
 }
 
@@ -433,8 +491,9 @@ fn processOneOp(self: *Client) !?Protocol.ServerOp {
         },
         .awaiting_msg_payload, .awaiting_hmsg_headers_and_payload => {
             const needed = self.parser.pendingBytes();
-            const payload_data = try self.conn.readExact(needed);
-            const op = try self.parser.parse(payload_data);
+            const result = try self.conn.readExactAlloc(self.allocator, needed);
+            defer result.free(self.allocator);
+            const op = try self.parser.parse(result.data);
 
             if (op) |server_op| {
                 try self.handleOp(server_op);
@@ -465,6 +524,7 @@ fn handleOp(self: *Client, op: Protocol.ServerOp) !void {
             try self.sub_mgr.dispatch(msg);
         },
         .info => |info| {
+            if (self.server_info) |*old| old.deinit();
             self.server_info = info;
             self.mergeConnectUrls(info);
         },
@@ -518,6 +578,13 @@ fn handleConnectionLoss(self: *Client) void {
     }
     self.tryReconnect() catch {
         self.status = .disconnected;
+    };
+}
+
+fn writeOrReconnect(self: *Client, data: []const u8) Error!void {
+    self.conn.write(data) catch {
+        try self.handleWriteFailure();
+        self.conn.write(data) catch return Error.NotConnected;
     };
 }
 

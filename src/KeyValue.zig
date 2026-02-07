@@ -48,7 +48,9 @@ pub const Bucket = struct {
             .storage = config.storage,
             .num_replicas = config.num_replicas,
             .max_bytes = config.max_bytes,
+            .max_age_ns = config.ttl_ns,
             .max_msg_size = config.max_value_size,
+            .max_msgs_per_subject = if (config.history > 0) @intCast(config.history) else -1,
             .discard = .new,
         }) catch |err| return mapJsError(err);
 
@@ -108,13 +110,40 @@ pub const Bucket = struct {
         // Check for error response (stream not found, key not found)
         if (JetStream.checkJsError(data)) |_| return null;
 
-        // Parse the response to extract the value
-        // Response contains: {"message":{"subject":"...","seq":N,"data":"base64..."}}
+        // Parse the response: {"message":{"subject":"...","seq":N,"data":"base64..."}}
+        const revision = extractRevision(data);
+
+        // Extract and decode base64 "data" field
+        const b64_data = JetStream.extractJsonString(data, "data") orelse return Entry{
+            .key = key,
+            .value = "",
+            .revision = revision,
+            .operation = .put,
+        };
+
+        // Decode base64 into an owned buffer
+        const decoded_len = std.base64.standard.Decoder.calcSizeUpperBound(b64_data.len);
+        const decoded_buf = self.allocator.alloc(u8, decoded_len) catch return Error.OutOfMemory;
+
+        const actual_len = std.base64.standard.Decoder.decode(decoded_buf, b64_data) catch |err| {
+            self.allocator.free(decoded_buf);
+            // If base64 decode fails, maybe it's raw data (some NATS versions)
+            _ = err;
+            return Entry{
+                .key = key,
+                .value = "",
+                .revision = revision,
+                .operation = .put,
+            };
+        };
+
         return Entry{
             .key = key,
-            .value = data,
-            .revision = extractRevision(data),
+            .value = decoded_buf[0..actual_len],
+            .revision = revision,
             .operation = .put,
+            ._value_buf = decoded_buf,
+            ._allocator = self.allocator,
         };
     }
 
@@ -183,6 +212,17 @@ pub const Entry = struct {
     value: []const u8,
     revision: u64 = 0,
     operation: Operation = .put,
+    /// Allocator-owned value buffer. Caller must call deinit() when done.
+    _value_buf: ?[]const u8 = null,
+    _allocator: ?Allocator = null,
+
+    pub fn deinit(self: *Entry) void {
+        if (self._value_buf) |buf| {
+            if (self._allocator) |a| a.free(buf);
+        }
+        self._value_buf = null;
+        self._allocator = null;
+    }
 };
 
 pub const Operation = enum { put, delete, purge };
@@ -200,7 +240,7 @@ pub const BucketConfig = struct {
 
 fn extractRevision(data: []const u8) u64 {
     if (JetStream.extractJsonInt(data, "seq")) |v| {
-        if (v >= 0) return @intCast(v);
+        return std.math.cast(u64, v) orelse 0;
     }
     return 0;
 }
